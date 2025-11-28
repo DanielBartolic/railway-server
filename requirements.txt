@@ -1,0 +1,22 @@
+# Discord Bot
+discord.py>=2.3.0
+
+# Web framework for webhook server
+flask>=3.0.0
+gunicorn>=21.0.0
+
+# HTTP client for async RunPod calls
+aiohttp>=3.9.0
+
+# Database
+supabase>=2.0.0
+
+# Payments
+stripe>=7.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# For requests in payments helper (sync)
+requests>=2.31.0
+
