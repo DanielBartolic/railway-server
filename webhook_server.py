@@ -13,6 +13,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 from functools import wraps
+from pathlib import Path
 from flask import Flask, request, jsonify
 import stripe
 
@@ -23,6 +24,54 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# ============================================
+# Credit Transaction Logging
+# ============================================
+
+class CreditLogger:
+    """Handles logging of all credit transactions to a file."""
+
+    def __init__(self, log_dir: str = "logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+        self.log_file = self.log_dir / "credits_logs.txt"
+
+    def log_transaction(
+        self,
+        discord_id: str,
+        action: str,
+        amount: int,
+        model: str = None,
+        status: str = None,
+        details: str = None
+    ):
+        """Log a credit transaction."""
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Build log entry
+        parts = [
+            timestamp,
+            discord_id,
+            action,
+            str(amount)
+        ]
+
+        if model:
+            parts.append(f"model={model}")
+        if status:
+            parts.append(f"status={status}")
+        if details:
+            parts.append(f"details={details}")
+
+        log_entry = " | ".join(parts)
+
+        # Append to log file
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(log_entry + "\n")
+
+# Global credit logger instance
+credit_logger = CreditLogger()
 
 app = Flask(__name__)
 
@@ -79,16 +128,24 @@ def get_or_create_user(discord_id: str, username: str = None) -> dict:
     return result.data[0]
 
 
-def add_credits(discord_id: str, amount: int, username: str = None) -> int:
+def add_credits(discord_id: str, amount: int, username: str = None, source: str = "PURCHASE") -> int:
     """Add credits to user. Returns new balance."""
     db = get_db()
     user = get_or_create_user(discord_id, username)
     new_balance = user["credits"] + amount
-    
+
     db.table("users").update({
         "credits": new_balance
     }).eq("discord_id", discord_id).execute()
-    
+
+    # Log the transaction
+    credit_logger.log_transaction(
+        discord_id=discord_id,
+        action=source,
+        amount=amount,
+        status="SUCCESS"
+    )
+
     logger.info(f"Added {amount} credits to user {discord_id}. New balance: {new_balance}")
     return new_balance
 
