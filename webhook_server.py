@@ -86,11 +86,10 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # Credit package mapping: price_id -> credits
-# $5 = 21,000 credits, $10 = 49,200 credits (+17% bonus), $0.60 = 252 credits (test)
+# $5 = 21,000 credits, $10 = 49,200 credits (+17% bonus)
 CREDIT_PACKAGES = {
     os.getenv("STRIPE_PRICE_21000_CREDITS", ""): 21000,
     os.getenv("STRIPE_PRICE_49200_CREDITS", ""): 49200,
-    os.getenv("STRIPE_PRICE_TEST", ""): 252,  # Temporary test package
 }
 
 # Initialize Stripe
