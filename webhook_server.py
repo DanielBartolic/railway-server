@@ -83,6 +83,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # Credit package mapping: price_id -> credits
 # $5 = 21,000 credits, $10 = 49,200 credits (+17% bonus), $0.60 = 252 credits (test)
@@ -171,6 +172,90 @@ def log_payment(discord_id: str, stripe_payment_id: str, amount_cents: int, cred
     }
     result = db.table("payments").insert(record).execute()
     return result.data[0]
+
+
+def send_discord_notification(
+    discord_id: str,
+    credits_added: int,
+    amount_cents: int,
+    new_balance: int,
+    username: str = None
+):
+    """Send payment notification to Discord webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("Discord webhook URL not configured, skipping notification")
+        return
+
+    try:
+        import requests
+
+        # Format amount as dollars
+        amount_dollars = amount_cents / 100
+
+        # Build embed
+        embed = {
+            "title": "💳 Payment Received",
+            "color": 0x00FF00,  # Green
+            "fields": [
+                {
+                    "name": "User",
+                    "value": f"<@{discord_id}>",
+                    "inline": True
+                },
+                {
+                    "name": "Amount Paid",
+                    "value": f"${amount_dollars:.2f}",
+                    "inline": True
+                },
+                {
+                    "name": "Credits Added",
+                    "value": f"{credits_added:,}",
+                    "inline": True
+                },
+                {
+                    "name": "New Balance",
+                    "value": f"{new_balance:,} credits",
+                    "inline": True
+                },
+                {
+                    "name": "Discord ID",
+                    "value": discord_id,
+                    "inline": True
+                }
+            ],
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Stripe Payment Webhook"
+            }
+        }
+
+        # Add username if available
+        if username:
+            embed["fields"].insert(1, {
+                "name": "Username",
+                "value": username,
+                "inline": True
+            })
+
+        # Send to Discord
+        payload = {
+            "embeds": [embed]
+        }
+
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json=payload,
+            timeout=10
+        )
+
+        if response.status_code == 204:
+            logger.info("✅ Discord notification sent successfully")
+        else:
+            logger.warning(f"Discord webhook returned status {response.status_code}")
+
+    except Exception as e:
+        # Don't fail payment processing if Discord notification fails
+        logger.error(f"Failed to send Discord notification: {e}")
 
 
 # ============================================
@@ -312,8 +397,16 @@ def process_successful_payment(session: dict):
         amount_cents=amount_cents,
         credits_added=credits_to_add
     )
-    
+
     logger.info(f"✅ Payment processed: {credits_to_add} credits -> user {discord_id} (balance: {new_balance})")
+
+    # Send Discord notification
+    send_discord_notification(
+        discord_id=discord_id,
+        credits_added=credits_to_add,
+        amount_cents=amount_cents,
+        new_balance=new_balance
+    )
 
 
 # ============================================
@@ -334,7 +427,8 @@ def health():
         "status": "healthy",
         "database": db_status,
         "stripe_configured": bool(STRIPE_SECRET_KEY),
-        "webhook_secret_configured": bool(STRIPE_WEBHOOK_SECRET)
+        "webhook_secret_configured": bool(STRIPE_WEBHOOK_SECRET),
+        "discord_webhook_configured": bool(DISCORD_WEBHOOK_URL)
     }), 200
 
 
@@ -363,6 +457,7 @@ if __name__ == "__main__":
     logger.info(f"Stripe configured: {bool(STRIPE_SECRET_KEY)}")
     logger.info(f"Webhook secret configured: {bool(STRIPE_WEBHOOK_SECRET)}")
     logger.info(f"Supabase configured: {bool(SUPABASE_URL and SUPABASE_KEY)}")
+    logger.info(f"Discord webhook configured: {bool(DISCORD_WEBHOOK_URL)}")
     
     # For local development only - use gunicorn in production
     app.run(host="0.0.0.0", port=port, debug=False)
