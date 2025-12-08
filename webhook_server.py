@@ -85,11 +85,30 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
+# Tier credit allocations (monthly base amounts)
+TIER_CREDITS = {
+    "free": 0,          # Free tier gets 0 monthly credits (only welcome bonus)
+    "basic": 58800,     # $14/month
+    "pro": 133224,      # $26/month
+    "creator": 308616,  # $44/month
+    "unlimited": -1     # $98/month (unlimited)
+}
+
+# Tier credit caps (maximum credits users can accumulate)
+TIER_CAPS = {
+    "free": 20000,      # Free tier cap: 20k
+    "basic": 108800,    # Basic cap: 58,800 + 50k
+    "pro": 183224,      # Pro cap: 133,224 + 50k
+    "creator": 358616,  # Creator cap: 308,616 + 50k
+    "unlimited": -1     # Unlimited has no cap
+}
+
 # Subscription tier mapping: price_id -> tier info
-# Basic: $14/month = 58,800 credits
-# Pro: $26/month = 133,224 credits (+22% bonus)
-# Creator: $44/month = 308,616 credits (+67% bonus)
-# Unlimited: $98/month = unlimited credits
+# Free: $0/month = 0 monthly credits (5,000 welcome bonus, 20k cap)
+# Basic: $14/month = 58,800 credits (108,800 cap)
+# Pro: $26/month = 133,224 credits (+22% bonus, 183,224 cap)
+# Creator: $44/month = 308,616 credits (+67% bonus, 358,616 cap)
+# Unlimited: $98/month = unlimited credits (no cap)
 SUBSCRIPTION_TIERS = {
     os.getenv("STRIPE_PRICE_BASIC", ""): {
         "tier": "basic",
@@ -132,43 +151,74 @@ def get_db():
 
 
 def get_or_create_user(discord_id: str, username: str = None) -> dict:
-    """Get existing user or create new one."""
+    """Get existing user or create new one with 5,000 welcome credits on free tier."""
     db = get_db()
     result = db.table("users").select("*").eq("discord_id", discord_id).execute()
-    
+
     if result.data:
         return result.data[0]
-    
+
+    # Create new user with free tier and 5,000 welcome credits
     new_user = {
         "discord_id": discord_id,
         "username": username,
-        "credits": 0,
+        "credits": 5000,  # Welcome bonus
+        "subscription_tier": "free",
         "total_generations": 0,
         "created_at": datetime.utcnow().isoformat()
     }
     result = db.table("users").insert(new_user).execute()
+
+    # Log the welcome bonus
+    credit_logger.log_transaction(
+        discord_id=discord_id,
+        action="WELCOME_BONUS",
+        amount=5000,
+        status="SUCCESS",
+        details="New user welcome bonus"
+    )
+
     return result.data[0]
 
 
 def add_credits(discord_id: str, amount: int, username: str = None, source: str = "PURCHASE") -> int:
-    """Add credits to user. Returns new balance."""
+    """Add credits to user with tier cap enforcement. Returns new balance."""
     db = get_db()
     user = get_or_create_user(discord_id, username)
-    new_balance = user["credits"] + amount
+    current_credits = user["credits"]
+    tier = user.get("subscription_tier", "free")
+
+    # Get tier cap
+    tier_cap = TIER_CAPS.get(tier, 20000)
+
+    # Handle unlimited tier (no cap)
+    if tier_cap == -1:
+        new_balance = current_credits + amount
+    else:
+        # Calculate new balance with cap
+        new_balance = min(current_credits + amount, tier_cap)
+
+    # Calculate actual amount added (may be less due to cap)
+    actual_amount_added = new_balance - current_credits
 
     db.table("users").update({
         "credits": new_balance
     }).eq("discord_id", discord_id).execute()
 
     # Log the transaction
+    details = None
+    if actual_amount_added < amount:
+        details = f"Capped at {tier_cap:,} (tier: {tier}). Requested {amount:,}, added {actual_amount_added:,}"
+
     credit_logger.log_transaction(
         discord_id=discord_id,
         action=source,
-        amount=amount,
-        status="SUCCESS"
+        amount=actual_amount_added,
+        status="SUCCESS",
+        details=details
     )
 
-    logger.info(f"Added {amount} credits to user {discord_id}. New balance: {new_balance}")
+    logger.info(f"Added {actual_amount_added} credits to user {discord_id} (tier: {tier}). New balance: {new_balance}")
     return new_balance
 
 
@@ -215,13 +265,7 @@ def create_or_update_subscription(
     db = get_db()
 
     # Get credits for tier
-    tier_credits = {
-        "basic": 58800,
-        "pro": 133224,
-        "creator": 308616,
-        "unlimited": -1  # -1 represents unlimited
-    }
-    credits = tier_credits.get(tier, 0)
+    credits = TIER_CREDITS.get(tier, 0)
 
     # Convert Unix timestamps to ISO format
     period_start = datetime.fromtimestamp(current_period_start).isoformat()
@@ -265,13 +309,7 @@ def reset_credits_to_tier_allowance(discord_id: str) -> dict:
         return None
 
     # Get credits for tier
-    tier_credits = {
-        "basic": 58800,
-        "pro": 133224,
-        "creator": 308616,
-        "unlimited": -1  # -1 represents unlimited
-    }
-    credits = tier_credits.get(tier, 0)
+    credits = TIER_CREDITS.get(tier, 0)
 
     # Reset credits
     result = db.table("users").update({
@@ -295,10 +333,11 @@ def reset_credits_to_tier_allowance(discord_id: str) -> dict:
 
 
 def suspend_subscription(discord_id: str) -> dict:
-    """Suspend user's subscription (failed payment)."""
+    """Suspend user's subscription (failed payment) - revert to free tier."""
     db = get_db()
     result = db.table("users").update({
         "subscription_status": "suspended",
+        "subscription_tier": "free",
         "credits": 0,
         "updated_at": datetime.utcnow().isoformat()
     }).eq("discord_id", discord_id).execute()
@@ -309,9 +348,9 @@ def suspend_subscription(discord_id: str) -> dict:
             action="SUBSCRIPTION_SUSPENDED",
             amount=0,
             status="SUCCESS",
-            details="Subscription suspended"
+            details="Subscription suspended - reverted to free tier"
         )
-        logger.info(f"Subscription suspended for {discord_id}")
+        logger.info(f"Subscription suspended for {discord_id} - reverted to free tier")
         return result.data[0]
     else:
         logger.error(f"Failed to suspend subscription for {discord_id}")
@@ -319,7 +358,7 @@ def suspend_subscription(discord_id: str) -> dict:
 
 
 def cancel_subscription_db(discord_id: str, immediate: bool = False) -> dict:
-    """Cancel user's subscription in database."""
+    """Cancel user's subscription in database - revert to free tier."""
     db = get_db()
     updates = {
         "updated_at": datetime.utcnow().isoformat()
@@ -327,6 +366,7 @@ def cancel_subscription_db(discord_id: str, immediate: bool = False) -> dict:
 
     if immediate:
         updates["subscription_status"] = "canceled"
+        updates["subscription_tier"] = "free"
         updates["credits"] = 0
         updates["cancel_at_period_end"] = False
     else:
@@ -340,9 +380,9 @@ def cancel_subscription_db(discord_id: str, immediate: bool = False) -> dict:
             action="SUBSCRIPTION_CANCELED",
             amount=0,
             status="SUCCESS",
-            details=f"Subscription canceled (immediate={immediate})"
+            details=f"Subscription canceled (immediate={immediate}) - reverted to free tier"
         )
-        logger.info(f"Subscription canceled for {discord_id} (immediate={immediate})")
+        logger.info(f"Subscription canceled for {discord_id} (immediate={immediate}) - reverted to free tier")
         return result.data[0]
     else:
         logger.error(f"Failed to cancel subscription for {discord_id}")
