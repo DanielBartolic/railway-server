@@ -11,9 +11,8 @@ Deployment:
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
-from pathlib import Path
 from flask import Flask, request, jsonify
 import stripe
 
@@ -26,52 +25,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# Credit Transaction Logging
+# Credit Transaction Logging (Database)
 # ============================================
 
-class CreditLogger:
-    """Handles logging of all credit transactions to a file."""
-
-    def __init__(self, log_dir: str = "logs"):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
-        self.log_file = self.log_dir / "credits_logs.txt"
-
-    def log_transaction(
-        self,
-        discord_id: str,
-        action: str,
-        amount: int,
-        model: str = None,
-        status: str = None,
-        details: str = None
-    ):
-        """Log a credit transaction."""
-        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Build log entry
-        parts = [
-            timestamp,
-            discord_id,
-            action,
-            str(amount)
-        ]
-
-        if model:
-            parts.append(f"model={model}")
-        if status:
-            parts.append(f"status={status}")
-        if details:
-            parts.append(f"details={details}")
-
-        log_entry = " | ".join(parts)
-
-        # Append to log file
-        with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(log_entry + "\n")
-
-# Global credit logger instance
-credit_logger = CreditLogger()
+def log_transaction(
+    discord_id: str,
+    action: str,
+    amount: int,
+    status: str = "SUCCESS",
+    model: str = None,
+    details: str = None
+):
+    """Log a credit transaction to the database."""
+    try:
+        db = get_db()
+        record = {
+            "discord_id": discord_id,
+            "action": action,
+            "amount": amount,
+            "status": status,
+            "model": model,
+            "details": details,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        db.table("credit_transactions").insert(record).execute()
+    except Exception as e:
+        # Silently fail logging to avoid breaking main operations
+        logger.error(f"Failed to log transaction: {e}")
 
 app = Flask(__name__)
 
@@ -165,12 +145,12 @@ def get_or_create_user(discord_id: str, username: str = None) -> dict:
         "credits": 5000,  # Welcome bonus
         "subscription_tier": "free",
         "total_generations": 0,
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     result = db.table("users").insert(new_user).execute()
 
     # Log the welcome bonus
-    credit_logger.log_transaction(
+    log_transaction(
         discord_id=discord_id,
         action="WELCOME_BONUS",
         amount=5000,
@@ -210,7 +190,7 @@ def add_credits(discord_id: str, amount: int, username: str = None, source: str 
     if actual_amount_added < amount:
         details = f"Capped at {tier_cap:,} (tier: {tier}). Requested {amount:,}, added {actual_amount_added:,}"
 
-    credit_logger.log_transaction(
+    log_transaction(
         discord_id=discord_id,
         action=source,
         amount=actual_amount_added,
@@ -238,7 +218,7 @@ def log_payment(discord_id: str, stripe_payment_id: str, amount_cents: int, cred
         "amount_cents": amount_cents,
         "credits_added": credits_added,
         "status": "completed",
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
     result = db.table("payments").insert(record).execute()
     return result.data[0]
@@ -284,7 +264,7 @@ def create_or_update_subscription(
         "current_period_end": period_end,
         "stripe_customer_id": stripe_customer_id,
         "cancel_at_period_end": cancel_at_period_end,
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
     # Only update credits if requested (new subs, upgrades)
@@ -295,7 +275,7 @@ def create_or_update_subscription(
 
     if result.data:
         action = "SUBSCRIPTION_CREATED" if update_credits else "SUBSCRIPTION_UPDATED"
-        credit_logger.log_transaction(
+        log_transaction(
             discord_id=discord_id,
             action=action,
             amount=credits if update_credits else 0,
@@ -325,11 +305,11 @@ def reset_credits_to_tier_allowance(discord_id: str) -> dict:
     # Reset credits
     result = db.table("users").update({
         "credits": credits,
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }).eq("discord_id", discord_id).execute()
 
     if result.data:
-        credit_logger.log_transaction(
+        log_transaction(
             discord_id=discord_id,
             action="CREDIT_RESET",
             amount=credits,
@@ -350,11 +330,11 @@ def suspend_subscription(discord_id: str) -> dict:
         "subscription_status": "suspended",
         "subscription_tier": "free",
         "credits": 0,
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }).eq("discord_id", discord_id).execute()
 
     if result.data:
-        credit_logger.log_transaction(
+        log_transaction(
             discord_id=discord_id,
             action="SUBSCRIPTION_SUSPENDED",
             amount=0,
@@ -372,7 +352,7 @@ def cancel_subscription_db(discord_id: str, immediate: bool = False) -> dict:
     """Cancel user's subscription in database - revert to free tier."""
     db = get_db()
     updates = {
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
     if immediate:
@@ -386,7 +366,7 @@ def cancel_subscription_db(discord_id: str, immediate: bool = False) -> dict:
     result = db.table("users").update(updates).eq("discord_id", discord_id).execute()
 
     if result.data:
-        credit_logger.log_transaction(
+        log_transaction(
             discord_id=discord_id,
             action="SUBSCRIPTION_CANCELED",
             amount=0,
@@ -449,7 +429,7 @@ def send_discord_notification(
                     "inline": True
                 }
             ],
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "footer": {
                 "text": "Stripe Payment Webhook"
             }
@@ -498,8 +478,8 @@ def rate_limit(max_requests: int = 30, window_seconds: int = 60):
             ip = request.headers.get('X-Forwarded-For', request.remote_addr)
             if ip:
                 ip = ip.split(',')[0].strip()
-            
-            now = datetime.utcnow()
+
+            now = datetime.now(timezone.utc)
             window_start = now - timedelta(seconds=window_seconds)
             
             # Clean old entries
