@@ -85,11 +85,32 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-# Credit package mapping: price_id -> credits
-# $5 = 21,000 credits, $10 = 49,200 credits (+17% bonus)
-CREDIT_PACKAGES = {
-    os.getenv("STRIPE_PRICE_21000_CREDITS", ""): 21000,
-    os.getenv("STRIPE_PRICE_49200_CREDITS", ""): 49200,
+# Subscription tier mapping: price_id -> tier info
+# Basic: $14/month = 58,800 credits
+# Pro: $26/month = 133,224 credits (+22% bonus)
+# Creator: $44/month = 308,616 credits (+67% bonus)
+# Unlimited: $98/month = unlimited credits
+SUBSCRIPTION_TIERS = {
+    os.getenv("STRIPE_PRICE_BASIC", ""): {
+        "tier": "basic",
+        "credits": 58800,
+        "name": "Basic Plan"
+    },
+    os.getenv("STRIPE_PRICE_PRO", ""): {
+        "tier": "pro",
+        "credits": 133224,
+        "name": "Pro Plan"
+    },
+    os.getenv("STRIPE_PRICE_CREATOR", ""): {
+        "tier": "creator",
+        "credits": 308616,
+        "name": "Creator Plan"
+    },
+    os.getenv("STRIPE_PRICE_UNLIMITED", ""): {
+        "tier": "unlimited",
+        "credits": -1,  # -1 represents unlimited
+        "name": "Unlimited Plan"
+    }
 }
 
 # Initialize Stripe
@@ -171,6 +192,161 @@ def log_payment(discord_id: str, stripe_payment_id: str, amount_cents: int, cred
     }
     result = db.table("payments").insert(record).execute()
     return result.data[0]
+
+
+# ============================================
+# Subscription Management
+# ============================================
+
+def create_or_update_subscription(
+    discord_id: str,
+    subscription_id: str,
+    status: str,
+    tier: str,
+    current_period_start: int,
+    current_period_end: int,
+    stripe_customer_id: str,
+    cancel_at_period_end: bool = False
+) -> dict:
+    """
+    Create or update subscription for a user.
+    Also sets credits to tier allowance.
+    """
+    db = get_db()
+
+    # Get credits for tier
+    tier_credits = {
+        "basic": 58800,
+        "pro": 133224,
+        "creator": 308616,
+        "unlimited": -1  # -1 represents unlimited
+    }
+    credits = tier_credits.get(tier, 0)
+
+    # Convert Unix timestamps to ISO format
+    period_start = datetime.fromtimestamp(current_period_start).isoformat()
+    period_end = datetime.fromtimestamp(current_period_end).isoformat()
+
+    result = db.table("users").update({
+        "subscription_id": subscription_id,
+        "subscription_status": status,
+        "subscription_tier": tier,
+        "current_period_start": period_start,
+        "current_period_end": period_end,
+        "stripe_customer_id": stripe_customer_id,
+        "cancel_at_period_end": cancel_at_period_end,
+        "credits": credits,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("discord_id", discord_id).execute()
+
+    if result.data:
+        credit_logger.log_transaction(
+            discord_id=discord_id,
+            action="SUBSCRIPTION_CREATED",
+            amount=credits,
+            status="SUCCESS",
+            details=f"{tier} tier subscription"
+        )
+        logger.info(f"Subscription created/updated for {discord_id}: {tier} tier, {credits} credits")
+        return result.data[0]
+    else:
+        logger.error(f"Failed to create/update subscription for {discord_id}")
+        return None
+
+
+def reset_credits_to_tier_allowance(discord_id: str) -> dict:
+    """Reset user's credits to their subscription tier allowance."""
+    db = get_db()
+    user = get_or_create_user(discord_id)
+    tier = user.get("subscription_tier")
+
+    if not tier:
+        logger.error(f"Cannot reset credits for {discord_id}: No subscription tier")
+        return None
+
+    # Get credits for tier
+    tier_credits = {
+        "basic": 58800,
+        "pro": 133224,
+        "creator": 308616,
+        "unlimited": -1  # -1 represents unlimited
+    }
+    credits = tier_credits.get(tier, 0)
+
+    # Reset credits
+    result = db.table("users").update({
+        "credits": credits,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("discord_id", discord_id).execute()
+
+    if result.data:
+        credit_logger.log_transaction(
+            discord_id=discord_id,
+            action="CREDIT_RESET",
+            amount=credits,
+            status="SUCCESS",
+            details=f"Credits reset to {tier} tier allowance"
+        )
+        logger.info(f"Credits reset for {discord_id}: {tier} tier → {credits} credits")
+        return result.data[0]
+    else:
+        logger.error(f"Failed to reset credits for {discord_id}")
+        return None
+
+
+def suspend_subscription(discord_id: str) -> dict:
+    """Suspend user's subscription (failed payment)."""
+    db = get_db()
+    result = db.table("users").update({
+        "subscription_status": "suspended",
+        "credits": 0,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("discord_id", discord_id).execute()
+
+    if result.data:
+        credit_logger.log_transaction(
+            discord_id=discord_id,
+            action="SUBSCRIPTION_SUSPENDED",
+            amount=0,
+            status="SUCCESS",
+            details="Subscription suspended"
+        )
+        logger.info(f"Subscription suspended for {discord_id}")
+        return result.data[0]
+    else:
+        logger.error(f"Failed to suspend subscription for {discord_id}")
+        return None
+
+
+def cancel_subscription_db(discord_id: str, immediate: bool = False) -> dict:
+    """Cancel user's subscription in database."""
+    db = get_db()
+    updates = {
+        "updated_at": datetime.utcnow().isoformat()
+    }
+
+    if immediate:
+        updates["subscription_status"] = "canceled"
+        updates["credits"] = 0
+        updates["cancel_at_period_end"] = False
+    else:
+        updates["cancel_at_period_end"] = True
+
+    result = db.table("users").update(updates).eq("discord_id", discord_id).execute()
+
+    if result.data:
+        credit_logger.log_transaction(
+            discord_id=discord_id,
+            action="SUBSCRIPTION_CANCELED",
+            amount=0,
+            status="SUCCESS",
+            details=f"Subscription canceled (immediate={immediate})"
+        )
+        logger.info(f"Subscription canceled for {discord_id} (immediate={immediate})")
+        return result.data[0]
+    else:
+        logger.error(f"Failed to cancel subscription for {discord_id}")
+        return None
 
 
 def send_discord_notification(
@@ -304,9 +480,9 @@ def stripe_webhook():
     """Handle Stripe webhook events."""
     payload = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
-    
+
     logger.info("Received webhook request")
-    
+
     # Verify webhook signature
     if STRIPE_WEBHOOK_SECRET:
         try:
@@ -324,15 +500,50 @@ def stripe_webhook():
         import json
         event = json.loads(payload)
         logger.warning("⚠️ Webhook signature verification DISABLED - set STRIPE_WEBHOOK_SECRET!")
-    
+
     event_type = event.get("type")
     logger.info(f"Event type: {event_type}")
-    
-    # Handle checkout completion
+
+    # Handle subscription checkout completion
     if event_type == "checkout.session.completed":
         session = event["data"]["object"]
-        process_successful_payment(session)
-    
+
+        # Check if it's a subscription checkout
+        if session.get("mode") == "subscription":
+            handle_subscription_checkout(session)
+        else:
+            # Old one-time payment (should not happen anymore)
+            logger.warning(f"[Deprecated] Received one-time payment checkout: {session['id']}")
+            process_successful_payment(session)  # Keep for backwards compatibility
+
+    # Handle subscription creation
+    elif event_type == "customer.subscription.created":
+        subscription = event["data"]["object"]
+        handle_subscription_created(subscription)
+
+    # Handle subscription updates (tier changes, etc.)
+    elif event_type == "customer.subscription.updated":
+        subscription = event["data"]["object"]
+        handle_subscription_updated(subscription)
+
+    # Handle subscription deletion (cancellation)
+    elif event_type == "customer.subscription.deleted":
+        subscription = event["data"]["object"]
+        handle_subscription_deleted(subscription)
+
+    # Handle successful invoice payment (monthly renewal)
+    elif event_type == "invoice.payment_succeeded":
+        invoice = event["data"]["object"]
+
+        # Only process subscription invoices
+        if invoice.get("billing_reason") == "subscription_cycle":
+            handle_subscription_renewal(invoice)
+
+    # Handle failed invoice payment
+    elif event_type == "invoice.payment_failed":
+        invoice = event["data"]["object"]
+        handle_payment_failed(invoice)
+
     return jsonify({"status": "success"}), 200
 
 
@@ -406,6 +617,167 @@ def process_successful_payment(session: dict):
         amount_cents=amount_cents,
         new_balance=new_balance
     )
+
+
+# ============================================
+# Subscription Event Handlers
+# ============================================
+
+def handle_subscription_checkout(session: dict):
+    """Handle successful subscription checkout."""
+    discord_id = session.get("client_reference_id")
+    subscription_id = session.get("subscription")
+    customer_id = session.get("customer")
+
+    if not discord_id:
+        logger.error(f"[Subscription] No client_reference_id in session: {session['id']}")
+        return
+
+    # Retrieve full subscription details from Stripe
+    subscription = stripe.Subscription.retrieve(subscription_id)
+
+    # Get price ID to determine tier
+    price_id = subscription["items"]["data"][0]["price"]["id"]
+    tier_info = SUBSCRIPTION_TIERS.get(price_id)
+
+    if not tier_info:
+        logger.error(f"[Subscription] Unknown price ID: {price_id}")
+        return
+
+    # Create subscription in database
+    create_or_update_subscription(
+        discord_id=discord_id,
+        subscription_id=subscription_id,
+        status=subscription["status"],
+        tier=tier_info["tier"],
+        current_period_start=subscription["current_period_start"],
+        current_period_end=subscription["current_period_end"],
+        stripe_customer_id=customer_id,
+        cancel_at_period_end=subscription["cancel_at_period_end"]
+    )
+
+    logger.info(f"[Subscription] Created {tier_info['name']} for Discord ID: {discord_id}")
+
+
+def handle_subscription_created(subscription: dict):
+    """Handle subscription.created event."""
+    customer_id = subscription["customer"]
+
+    # Get discord_id from customer metadata
+    customer = stripe.Customer.retrieve(customer_id)
+    discord_id = customer.get("metadata", {}).get("discord_id")
+
+    if not discord_id:
+        logger.error(f"[Subscription] No discord_id in customer metadata: {customer_id}")
+        return
+
+    # Get tier from price ID
+    price_id = subscription["items"]["data"][0]["price"]["id"]
+    tier_info = SUBSCRIPTION_TIERS.get(price_id)
+
+    if not tier_info:
+        logger.error(f"[Subscription] Unknown price ID: {price_id}")
+        return
+
+    # Create/update subscription
+    create_or_update_subscription(
+        discord_id=discord_id,
+        subscription_id=subscription["id"],
+        status=subscription["status"],
+        tier=tier_info["tier"],
+        current_period_start=subscription["current_period_start"],
+        current_period_end=subscription["current_period_end"],
+        stripe_customer_id=customer_id,
+        cancel_at_period_end=subscription["cancel_at_period_end"]
+    )
+
+    logger.info(f"[Subscription] Created for Discord ID: {discord_id}")
+
+
+def handle_subscription_updated(subscription: dict):
+    """Handle subscription.updated event (tier changes, status changes)."""
+    customer_id = subscription["customer"]
+
+    # Get discord_id from customer metadata
+    customer = stripe.Customer.retrieve(customer_id)
+    discord_id = customer.get("metadata", {}).get("discord_id")
+
+    if not discord_id:
+        logger.error(f"[Subscription] No discord_id in customer metadata: {customer_id}")
+        return
+
+    # Get tier from price ID
+    price_id = subscription["items"]["data"][0]["price"]["id"]
+    tier_info = SUBSCRIPTION_TIERS.get(price_id)
+
+    # Update subscription
+    create_or_update_subscription(
+        discord_id=discord_id,
+        subscription_id=subscription["id"],
+        status=subscription["status"],
+        tier=tier_info["tier"] if tier_info else "unknown",
+        current_period_start=subscription["current_period_start"],
+        current_period_end=subscription["current_period_end"],
+        stripe_customer_id=customer_id,
+        cancel_at_period_end=subscription["cancel_at_period_end"]
+    )
+
+    logger.info(f"[Subscription] Updated for Discord ID: {discord_id}")
+
+
+def handle_subscription_deleted(subscription: dict):
+    """Handle subscription.deleted event (cancellation)."""
+    customer_id = subscription["customer"]
+
+    # Get discord_id from customer metadata
+    customer = stripe.Customer.retrieve(customer_id)
+    discord_id = customer.get("metadata", {}).get("discord_id")
+
+    if not discord_id:
+        logger.error(f"[Subscription] No discord_id in customer metadata: {customer_id}")
+        return
+
+    # Suspend subscription (set credits to 0, status to canceled)
+    cancel_subscription_db(discord_id, immediate=True)
+
+    logger.info(f"[Subscription] Deleted for Discord ID: {discord_id}")
+
+
+def handle_subscription_renewal(invoice: dict):
+    """Handle successful subscription renewal (monthly reset)."""
+    customer_id = invoice["customer"]
+    subscription_id = invoice["subscription"]
+
+    # Get discord_id from customer metadata
+    customer = stripe.Customer.retrieve(customer_id)
+    discord_id = customer.get("metadata", {}).get("discord_id")
+
+    if not discord_id:
+        logger.error(f"[Subscription] No discord_id in customer metadata: {customer_id}")
+        return
+
+    # Reset credits to tier allowance
+    reset_credits_to_tier_allowance(discord_id)
+
+    logger.info(f"[Subscription] Renewal processed for Discord ID: {discord_id}")
+
+
+def handle_payment_failed(invoice: dict):
+    """Handle failed payment (suspend immediately)."""
+    customer_id = invoice["customer"]
+
+    # Get discord_id from customer metadata
+    customer = stripe.Customer.retrieve(customer_id)
+    discord_id = customer.get("metadata", {}).get("discord_id")
+
+    if not discord_id:
+        logger.error(f"[Subscription] No discord_id in customer metadata: {customer_id}")
+        return
+
+    # Suspend subscription immediately
+    suspend_subscription(discord_id)
+
+    logger.info(f"[Subscription] Suspended due to failed payment for Discord ID: {discord_id}")
 
 
 # ============================================
