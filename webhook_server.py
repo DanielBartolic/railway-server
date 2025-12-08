@@ -256,11 +256,15 @@ def create_or_update_subscription(
     current_period_start: int,
     current_period_end: int,
     stripe_customer_id: str,
-    cancel_at_period_end: bool = False
+    cancel_at_period_end: bool = False,
+    update_credits: bool = True
 ) -> dict:
     """
     Create or update subscription for a user.
-    Also sets credits to tier allowance.
+
+    Args:
+        update_credits: If True, sets credits to tier allowance (for new subs and upgrades).
+                       If False, keeps existing credits (for downgrades - credits update on renewal).
     """
     db = get_db()
 
@@ -271,7 +275,8 @@ def create_or_update_subscription(
     period_start = datetime.fromtimestamp(current_period_start).isoformat()
     period_end = datetime.fromtimestamp(current_period_end).isoformat()
 
-    result = db.table("users").update({
+    # Build update dict
+    updates = {
         "subscription_id": subscription_id,
         "subscription_status": status,
         "subscription_tier": tier,
@@ -279,19 +284,25 @@ def create_or_update_subscription(
         "current_period_end": period_end,
         "stripe_customer_id": stripe_customer_id,
         "cancel_at_period_end": cancel_at_period_end,
-        "credits": credits,
         "updated_at": datetime.utcnow().isoformat()
-    }).eq("discord_id", discord_id).execute()
+    }
+
+    # Only update credits if requested (new subs, upgrades)
+    if update_credits:
+        updates["credits"] = credits
+
+    result = db.table("users").update(updates).eq("discord_id", discord_id).execute()
 
     if result.data:
+        action = "SUBSCRIPTION_CREATED" if update_credits else "SUBSCRIPTION_UPDATED"
         credit_logger.log_transaction(
             discord_id=discord_id,
-            action="SUBSCRIPTION_CREATED",
-            amount=credits,
+            action=action,
+            amount=credits if update_credits else 0,
             status="SUCCESS",
-            details=f"{tier} tier subscription"
+            details=f"{tier} tier subscription {'(credits updated)' if update_credits else '(credits preserved until renewal)'}"
         )
-        logger.info(f"Subscription created/updated for {discord_id}: {tier} tier, {credits} credits")
+        logger.info(f"Subscription created/updated for {discord_id}: {tier} tier, credits {'updated to ' + str(credits) if update_credits else 'preserved'}")
         return result.data[0]
     else:
         logger.error(f"Failed to create/update subscription for {discord_id}")
@@ -746,20 +757,44 @@ def handle_subscription_updated(subscription: dict):
         logger.error(f"[Subscription] No discord_id in customer metadata: {customer_id}")
         return
 
-    # Get tier from price ID
+    # Get new tier from price ID
     price_id = subscription["items"]["data"][0]["price"]["id"]
     tier_info = SUBSCRIPTION_TIERS.get(price_id)
+    new_tier = tier_info["tier"] if tier_info else "unknown"
+
+    # Get current user to check for tier changes
+    user = get_or_create_user(discord_id)
+    old_tier = user.get("subscription_tier", "free")
+
+    # Determine if this is an upgrade or downgrade
+    tier_hierarchy = {"free": 0, "basic": 1, "pro": 2, "creator": 3, "unlimited": 4}
+    old_tier_level = tier_hierarchy.get(old_tier, 0)
+    new_tier_level = tier_hierarchy.get(new_tier, 0)
+
+    is_upgrade = new_tier_level > old_tier_level
+    is_new_subscription = old_tier == "free"
+
+    # For upgrades and new subscriptions: update credits immediately
+    # For downgrades: preserve current credits until renewal
+    update_credits = is_upgrade or is_new_subscription
+
+    if not is_new_subscription:
+        if is_upgrade:
+            logger.info(f"[Subscription] UPGRADE detected: {old_tier} → {new_tier} for {discord_id}")
+        else:
+            logger.info(f"[Subscription] DOWNGRADE detected: {old_tier} → {new_tier} for {discord_id}. Credits preserved until renewal.")
 
     # Update subscription
     create_or_update_subscription(
         discord_id=discord_id,
         subscription_id=subscription["id"],
         status=subscription["status"],
-        tier=tier_info["tier"] if tier_info else "unknown",
+        tier=new_tier,
         current_period_start=subscription["current_period_start"],
         current_period_end=subscription["current_period_end"],
         stripe_customer_id=customer_id,
-        cancel_at_period_end=subscription["cancel_at_period_end"]
+        cancel_at_period_end=subscription["cancel_at_period_end"],
+        update_credits=update_credits
     )
 
     logger.info(f"[Subscription] Updated for Discord ID: {discord_id}")
