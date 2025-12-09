@@ -202,28 +202,6 @@ def add_credits(discord_id: str, amount: int, username: str = None, source: str 
     return new_balance
 
 
-def get_payment_by_stripe_id(stripe_payment_id: str) -> dict | None:
-    """Check if payment already processed (idempotency)."""
-    db = get_db()
-    result = db.table("payments").select("*").eq("stripe_payment_id", stripe_payment_id).execute()
-    return result.data[0] if result.data else None
-
-
-def log_payment(discord_id: str, stripe_payment_id: str, amount_cents: int, credits_added: int) -> dict:
-    """Log a successful payment."""
-    db = get_db()
-    record = {
-        "discord_id": discord_id,
-        "stripe_payment_id": stripe_payment_id,
-        "amount_cents": amount_cents,
-        "credits_added": credits_added,
-        "status": "completed",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    result = db.table("payments").insert(record).execute()
-    return result.data[0]
-
-
 # ============================================
 # Subscription Management
 # ============================================
@@ -539,13 +517,12 @@ def stripe_webhook():
     if event_type == "checkout.session.completed":
         session = event["data"]["object"]
 
-        # Check if it's a subscription checkout
+        # Only accept subscription checkouts
         if session.get("mode") == "subscription":
             handle_subscription_checkout(session)
         else:
-            # Old one-time payment (should not happen anymore)
-            logger.warning(f"[Deprecated] Received one-time payment checkout: {session['id']}")
-            process_successful_payment(session)  # Keep for backwards compatibility
+            # Reject one-time payments (not supported)
+            logger.warning(f"[Rejected] One-time payment checkout not supported: {session['id']}")
 
     # Handle subscription creation
     elif event_type == "customer.subscription.created":
@@ -576,78 +553,6 @@ def stripe_webhook():
         handle_payment_failed(invoice)
 
     return jsonify({"status": "success"}), 200
-
-
-def process_successful_payment(session: dict):
-    """Process a successful payment and add credits."""
-    payment_id = session.get("id") or session.get("payment_intent")
-    
-    # Idempotency check
-    if get_payment_by_stripe_id(payment_id):
-        logger.info(f"Payment {payment_id} already processed, skipping")
-        return
-    
-    # Get Discord user ID
-    discord_id = session.get("client_reference_id")
-    if not discord_id:
-        discord_id = session.get("metadata", {}).get("discord_id")
-    
-    if not discord_id:
-        logger.error(f"No discord_id found in payment {payment_id}")
-        logger.error(f"Session keys: {list(session.keys())}")
-        return
-    
-    # Determine credits
-    credits_to_add = 0
-    amount_cents = session.get("amount_total", 0)
-    
-    # From metadata
-    metadata = session.get("metadata", {})
-    if "credits" in metadata:
-        credits_to_add = int(metadata["credits"])
-    
-    # From line items / price ID
-    if credits_to_add == 0:
-        try:
-            full_session = stripe.checkout.Session.retrieve(
-                session["id"],
-                expand=["line_items.data.price"]
-            )
-            for item in full_session.line_items.data:
-                price_id = item.price.id
-                # Check our mapping
-                if price_id in CREDIT_PACKAGES:
-                    credits_to_add += CREDIT_PACKAGES[price_id] * item.quantity
-                # Check price metadata
-                elif item.price.metadata.get("credits"):
-                    credits_to_add += int(item.price.metadata["credits"]) * item.quantity
-        except Exception as e:
-            logger.error(f"Error fetching session details: {e}")
-    
-    if credits_to_add == 0:
-        logger.error(f"Could not determine credits for payment {payment_id}")
-        return
-    
-    # Add credits
-    new_balance = add_credits(discord_id, credits_to_add)
-    
-    # Log payment
-    log_payment(
-        discord_id=discord_id,
-        stripe_payment_id=payment_id,
-        amount_cents=amount_cents,
-        credits_added=credits_to_add
-    )
-
-    logger.info(f"✅ Payment processed: {credits_to_add} credits -> user {discord_id} (balance: {new_balance})")
-
-    # Send Discord notification
-    send_discord_notification(
-        discord_id=discord_id,
-        credits_added=credits_to_add,
-        amount_cents=amount_cents,
-        new_balance=new_balance
-    )
 
 
 # ============================================
